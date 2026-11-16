@@ -1,0 +1,4 @@
+{
+  "mode": "email-otp",
+  "endpoint": "https://gjcheuuuoudztylwhzhv.supabase.co/functions/v1/daily-bench-auth"
+}
