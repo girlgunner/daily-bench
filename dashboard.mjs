@@ -123,8 +123,10 @@ function createTabSession(storage,now=()=>Date.now()){
  const key='daily-bench-session-v1';let cached='';
  const clear=()=>{cached='';try{storage?.removeItem(key);}catch{}};
  const expiry=token=>{try{if(typeof token!=='string'||token.length>1000||token.split('.').length!==2)return 0;const p=token.split('.')[0].replaceAll('-','+').replaceAll('_','/');return JSON.parse(atob(p)).exp||0;}catch{return 0;}};
- const read=()=>{let token=cached;try{token=storage?.getItem(key)||cached;}catch{}const exp=expiry(token);if(!Number.isSafeInteger(exp)||exp<=now()||exp>now()+30*60000){clear();return '';}return token;};
- const save=token=>{const exp=expiry(token);if(!Number.isSafeInteger(exp)||exp<=now()||exp>now()+30*60000)return;cached=token;try{storage?.setItem(key,token);}catch{}};
+ // Allow a small client/server clock difference. The server still enforces
+ // the signed original 30-minute expiry for every resume and write.
+ const read=()=>{let token=cached;try{token=storage?.getItem(key)||cached;}catch{}const exp=expiry(token);if(!Number.isSafeInteger(exp)||exp<=now()||exp>now()+31*60000){clear();return '';}return token;};
+ const save=token=>{const exp=expiry(token);if(!Number.isSafeInteger(exp)||exp<=now()||exp>now()+31*60000)return;cached=token;try{storage?.setItem(key,token);}catch{}};
  return {read,save,clear};
 }
 function initialiseOtp({endpoint,onUnlocked,documentRoot=document,fetcher=fetch,random=crypto,storage}){
