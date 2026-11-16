@@ -120,8 +120,8 @@ export function validateTask(input, previous = null, day = today()) {
   } else t.bill = null;
   if (t.source) {
     const source = t.source;
-    if (typeof source !== 'object' || Array.isArray(source) || source.provider !== 'outlook') throw new Error('邮件来源格式不正确');
-    const clean = { provider: 'outlook' };
+    if (typeof source !== 'object' || Array.isArray(source) || !['outlook','gmail'].includes(source.provider)) throw new Error('邮件来源格式不正确');
+    const clean = { provider: source.provider };
     for (const k of ['key', 'messageId', 'subject', 'sender', 'receivedAt', 'url', 'excerpt', 'confidence', 'proposedStatus', 'proposedDueDate']) {
       if (source[k] !== undefined && typeof source[k] !== 'string') throw new Error('邮件来源字段不正确');
       clean[k] = String(source[k] || '').slice(0, k === 'url' ? 4000 : k === 'excerpt' ? 800 : 1000);
@@ -132,7 +132,7 @@ export function validateTask(input, previous = null, day = today()) {
     if (!validDate(clean.proposedDueDate)) throw new Error('邮件建议日期不正确');
     t.source = clean;
   }
-  if(t.completionEvidence){const e=t.completionEvidence;if(typeof e!=='object'||!e.messageId||!e.excerpt||!/^https:\/\//.test(e.url||'')||Number.isNaN(Date.parse(e.receivedAt)))throw new Error('完成证据格式不正确');t.completionEvidence={provider:'outlook',messageId:String(e.messageId).slice(0,1000),url:String(e.url).slice(0,4000),receivedAt:e.receivedAt,excerpt:String(e.excerpt).slice(0,1000),reason:String(e.reason||'').slice(0,1000),automatic:e.automatic===true};}
+  if(t.completionEvidence){const e=t.completionEvidence,chat=e.provider==='conversation';if(typeof e!=='object'||!e.messageId||!e.excerpt||(!chat&&!/^https:\/\//.test(e.url||''))||(chat&&(!e.threadId||!e.turnId||!['user-confirmation','verified-result','partial','draft','summary'].includes(e.evidenceType)))||Number.isNaN(Date.parse(e.receivedAt)))throw new Error('完成证据格式不正确');t.completionEvidence={provider:chat?'conversation':e.provider==='gmail'?'gmail':'outlook',messageId:String(e.messageId).slice(0,1000),url:String(e.url||'').slice(0,4000),receivedAt:e.receivedAt,excerpt:String(e.excerpt).slice(0,1000),reason:String(e.reason||'').slice(0,1000),automatic:e.automatic===true,...(chat?{threadId:String(e.threadId).slice(0,1000),turnId:String(e.turnId).slice(0,1000),evidenceType:e.evidenceType,...(e.resultReceipt?{resultReceipt:{tool:String(e.resultReceipt.tool).slice(0,200),recordId:String(e.resultReceipt.recordId).slice(0,1000)}}:{})}:{})};}
   if(t.status!=='done')t.completionEvidence=null;
   return t;
 }
