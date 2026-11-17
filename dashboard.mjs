@@ -1,31 +1,60 @@
+// A deterministic view of durable owner commands, never a second task store.
+function projectDecisionState(state,requests=[]){
+ if(!state)return state;const next=structuredClone(state);
+ const tasks=new Map(next.tables.tasks.map(r=>[r.id,{row:r,task:JSON.parse(r.json)}]));
+ const settings=key=>{const row=next.tables.settings.find(r=>r.key===key);return row?{row,value:JSON.parse(row.json)}:null;};
+ for(const request of [...requests].sort((a,b)=>String(a.createdAt||'').localeCompare(String(b.createdAt||'')))){
+  if(!request.text?.startsWith('BOARD_DECISION '))continue;
+  let d;try{d=JSON.parse(request.text.slice(15));}catch{continue;}
+  const entry=tasks.get(d.taskId),t=entry?.task;if(!t||t.deletedAt||t.revision!==d.revision||d.title&&d.title!==t.title||d.sourceKey&&d.sourceKey!==t.source?.key)continue;
+  let changed=false;
+  if(d.kind==='calendar'&&d.choice==='confirm'&&request.calendarResult?.verified&&t.status==='review'){
+   const event=request.calendarResult.event,p=d.proposal;
+   if(p&&event?.id&&event.title===p.title&&Date.parse(event.start)===Date.parse(p.start)&&Date.parse(event.end)===Date.parse(p.end)&&(event.location||'')===(p.location||'')){
+    t.status='done';t.completedAt=request.calendarResult.verifiedAt;changed=true;
+    const calendar=settings('calendar');if(calendar){calendar.value.events=(calendar.value.events||[]).filter(e=>e.id!==event.id).concat({...event,provider:'google'});calendar.row.json=JSON.stringify(calendar.value);}
+   }
+  }
+  if(d.choice==='ignore'&&['review','todo','waiting'].includes(t.status)){t.status='cancelled';t.ignoredAt=request.createdAt;changed=true;}
+  else if(d.choice==='accept'&&t.status==='review'&&d.kind!=='calendar'){t.status=t.opportunity?'todo':t.source?.proposedStatus||'todo';if(t.opportunity)t.longTerm=true;changed=true;}
+  else if((d.kind==='work'&&d.choice==='complete'||d.kind==='completion'&&d.choice==='confirm')&&['todo','waiting'].includes(t.status)){t.status='done';t.completedAt=request.createdAt;t.steps=(t.steps||[]).map(s=>({...s,done:true}));changed=true;}
+  if(d.kind==='completion'){
+   const f=settings('completion-feedback');if(f){for(const item of f.value)if(item.id===d.feedbackId&&item.status==='pending')item.status=d.choice==='keep'?'kept':'confirmed';f.row.json=JSON.stringify(f.value);}
+  }
+  if(changed){t.revision++;t.updatedAt=request.createdAt||t.updatedAt;entry.row.json=JSON.stringify(t);}
+ }
+ return next;
+}
 function createDecisionBoard({getState,endpoint,onChange,documentRoot=document,fetcher=fetch}){
- const $=id=>documentRoot.getElementById(id);let token='',requests=[],error='',epoch=0;
+ const $=id=>documentRoot.getElementById(id);let token='',requests=[],error='',notice='',epoch=0;const busy=new Set();
  const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
- const tasks=()=>getState()?.tables.tasks.map(r=>JSON.parse(r.json))||[];
+ const snapshot=()=>projectDecisionState(getState(),requests);
+ const tasks=()=>snapshot()?.tables.tasks.map(r=>JSON.parse(r.json))||[];
  const setting=key=>{const r=getState()?.tables.settings.find(x=>x.key===key);return r?JSON.parse(r.json):null;};
- const pending=id=>requests.find(r=>r.taskId===id&&r.status==='pending');
+ const pending=id=>requests.find(r=>r.taskId===id&&r.status==='pending'&&r.kind==='calendar'&&r.choice==='confirm'&&!r.calendarResult?.verified);
  const ignored=id=>requests.some(r=>r.taskId===id&&r.choice==='ignore'&&(r.status==='pending'||r.currentTaskStatus==='cancelled'));
- async function api(data){const r=await fetcher(endpoint.replace(/\/$/,'')+'/board',{method:'POST',credentials:'omit',redirect:'error',cache:'no-store',signal:AbortSignal.timeout(30000),headers:{'Content-Type':'application/json'},body:JSON.stringify({...data,sessionToken:token})});const value=await r.json();if(!r.ok)throw Error(value.error||'Could not save your choice.');return value;}
+ async function api(data){const r=await fetcher(endpoint.replace(/\/$/,'')+'/board',{method:'POST',credentials:'omit',redirect:'error',cache:'no-store',signal:AbortSignal.timeout(60000),headers:{'Content-Type':'application/json'},body:JSON.stringify({...data,sessionToken:token})});const value=await r.json();if(!r.ok)throw Error(value.error||'Could not save your choice.');return value;}
  const source=t=>/^https:\/\//.test(t.source?.url||t.link||'')?'<a target="_blank" rel="noopener noreferrer" href="'+esc(t.source?.url||t.link)+'">View source ↗</a>':'';
- const buttons=(t,kind,choices,feedbackId='')=>pending(t.id)?'<p class="queued">Saved · waiting for the next scan</p>':'<div class="decision-actions">'+choices.map(([choice,label])=>'<button data-decision="'+choice+'" data-task="'+esc(t.id)+'" data-revision="'+t.revision+'" data-kind="'+kind+'" data-feedback="'+esc(feedbackId)+'">'+label+'</button>').join('')+'</div>';
+ const buttons=(t,kind,choices,feedbackId='')=>pending(t.id)?'<p class="queued">Confirmed · calendar update not yet completed</p><button data-decision="confirm" data-kind="calendar" data-task="'+esc(t.id)+'" data-revision="'+t.revision+'">Retry calendar update</button>':'<div class="decision-actions">'+choices.map(([choice,label])=>'<button data-decision="'+choice+'" data-task="'+esc(t.id)+'" data-revision="'+t.revision+'" data-kind="'+kind+'" data-feedback="'+esc(feedbackId)+'">'+label+'</button>').join('')+'</div>';
  const date=(label,value)=>'<div><dt>'+label+'</dt><dd>'+esc(value||'Not confirmed')+'</dd></div>';
  function render(){
   if(!getState())return;
-  const list=tasks().filter(t=>!t.deletedAt&&!ignored(t.id)),proposals=setting('meeting-proposals')||{};
+  const list=tasks().filter(t=>!t.deletedAt),proposals=setting('meeting-proposals')||{};
   const decisions=list.filter(t=>t.status==='review'&&!t.opportunity&&(proposals[t.id]||t.importance==='high'||t.priority==='high'||/^Decide whether/i.test(t.title)||(effectiveDueDate(t)&&effectiveDueDate(t)<=addDays(today(),7)))).sort((a,b)=>Number(Boolean(proposals[b.id]))-Number(Boolean(proposals[a.id]))||((a.dueDate||'9999').localeCompare(b.dueDate||'9999'))||String(b.updatedAt).localeCompare(a.updatedAt));
-  const feedback=(setting('completion-feedback')||[]).filter(f=>f.status==='pending').map(f=>({f,t:list.find(t=>t.id===f.taskId&&['todo','waiting'].includes(t.status))})).filter(x=>x.t);
+  const projectedFeedback=snapshot()?.tables.settings.find(x=>x.key==='completion-feedback');
+  const feedback=(projectedFeedback?JSON.parse(projectedFeedback.json):[]).filter(f=>f.status==='pending').map(f=>({f,t:list.find(t=>t.id===f.taskId&&['todo','waiting'].includes(t.status))})).filter(x=>x.t);
   $('decisions').innerHTML=decisions.map(t=>{const p=proposals[t.id],kind=p?'calendar':'task';return '<article class="decision-card"><p class="card-kind">'+(p?'Calendar check':'For your decision')+'</p><h3>'+esc(t.title.replace(/^Check calendar entry: /,''))+'</h3><p>'+esc(p?.question||t.notes||t.source?.excerpt||'Would you like to take this forward?')+'</p>'+(p?'<dl>'+date('When',p.start?new Intl.DateTimeFormat('en-GB',{timeZone:'Asia/Hong_Kong',dateStyle:'medium',timeStyle:'short'}).format(new Date(p.start))+' HKT':'')+date('Until',p.end?new Intl.DateTimeFormat('en-GB',{timeZone:'Asia/Hong_Kong',timeStyle:'short'}).format(new Date(p.end)):'')+date('Where',p.location)+'</dl><label for="answer-'+esc(t.id)+'">Details or correction'+(!p.confirmed?' (required)':' (optional)')+'</label><textarea id="answer-'+esc(t.id)+'" maxlength="1000" rows="2" placeholder="Confirm missing details or correct the proposal"></textarea>':'')+source(t)+buttons(t,kind,p?[['confirm','Confirm details'],['ignore','Ignore']]:[['accept','Accept'],['ignore','Ignore']])+'</article>';}).join('')+feedback.map(({t,f})=>'<article class="decision-card"><p class="card-kind">Completion check</p><h3>'+esc(t.title)+'</h3><p>'+esc(f.reason||f.excerpt)+'</p>'+source(t)+buttons(t,'completion',[['confirm','Completed'],['keep','Keep open']],f.id)+'</article>').join('');
   $('decisions-empty').hidden=Boolean(decisions.length+feedback.length);
   const opportunities=list.filter(t=>t.status==='review'&&t.opportunity&&t.opportunity.recommendation!=='skip'&&t.opportunity.eligibilityStatus!=='ineligible').sort((a,b)=>(a.internalDueDate||a.externalDueDate||a.dueDate||'9999').localeCompare(b.internalDueDate||b.externalDueDate||b.dueDate||'9999'));
   $('opportunities').innerHTML=opportunities.map(t=>'<article class="decision-card opportunity-card"><p class="card-kind">'+esc(t.opportunity.type)+' · '+(t.opportunity.recommendation==='consider'?'Worth considering':'Possible fit')+'</p><h3>'+esc(t.title)+'</h3><dl>'+date('Why it fits',t.opportunity.fit)+date('Eligibility',t.opportunity.eligibility)+date('Preparation',t.opportunity.effort)+date('Internal deadline',t.internalDueDate)+date('External deadline',t.externalDueDate||t.dueDate)+'</dl>'+source(t)+buttons(t,'task',[['accept','Pursue'],['ignore','Ignore']])+'</article>').join('');
   $('opportunities-empty').hidden=Boolean(opportunities.length);
   $('decision-count').textContent=decisions.length+feedback.length;$('opportunity-count').textContent=opportunities.length;
-  const pendingList=requests.filter(r=>r.status==='pending'),recent=requests.filter(r=>r.status==='done').slice(-5).reverse();
-  $('request-status').innerHTML=(error?'<p class="error">'+esc(error)+'</p>':'')+(pendingList.length?'<p class="queued">'+pendingList.length+' saved '+(pendingList.length===1?'choice':'choices')+' waiting for the next scan.</p>':'')+(recent.length?'<details><summary>Recent results</summary>'+recent.map(r=>'<p>'+esc(r.reply)+'</p>').join('')+'</details>':'');
+  const calendarPending=requests.filter(r=>r.status==='pending'&&r.kind==='calendar'&&r.choice==='confirm'&&!r.calendarResult?.verified),notes=requests.filter(r=>r.status==='pending'&&r.kind==='note'),recent=requests.filter(r=>r.status==='done').slice(-5).reverse();
+  $('request-status').innerHTML=(error?'<p class="error" role="alert">'+esc(error)+'</p>':'')+(notice?'<p role="status">'+esc(notice)+'</p>':'')+(calendarPending.length?'<p class="queued">'+calendarPending.length+' confirmed calendar '+(calendarPending.length===1?'update has':'updates have')+' not yet been written to your calendar.</p>':'')+(notes.length?'<p class="queued">Note saved for your next review.</p>':'')+(recent.length?'<details><summary>Recent results</summary>'+recent.map(r=>'<p>'+esc(r.reply)+'</p>').join('')+'</details>':'');
  }
- documentRoot.addEventListener('click',async event=>{const b=event.target.closest?.('[data-decision]');if(!b||!getState())return;b.disabled=true;error='';try{const task=tasks().find(t=>t.id===b.dataset.task);if(!task)throw Error('Please refresh.');const id=crypto.randomUUID(),answer=$('answer-'+task.id)?.value.trim()||'';const value=await api({action:'submit',id,taskId:task.id,revision:Number(b.dataset.revision),kind:b.dataset.kind,feedbackId:b.dataset.feedback,choice:b.dataset.decision,answer});requests.push({id:value.id,taskId:task.id,choice:b.dataset.decision,status:'pending'});render();onChange?.();}catch(e){error=e.message;render();}finally{b.disabled=false;}});
+ documentRoot.addEventListener('click',async event=>{const b=event.target.closest?.('[data-decision]');if(!b||!getState()||busy.has(b.dataset.task))return;busy.add(b.dataset.task);b.disabled=true;b.textContent='Saving…';error='';notice='';const attempt=epoch;try{const task=tasks().find(t=>t.id===b.dataset.task);if(!task)throw Error('Please refresh.');const id=crypto.randomUUID(),answer=pending(task.id)?JSON.parse(pending(task.id).text.slice(15)).answer||'':$('answer-'+task.id)?.value.trim()||'',d={kind:b.dataset.kind,taskId:task.id,revision:Number(b.dataset.revision),choice:b.dataset.decision,feedbackId:b.dataset.feedback,...(b.dataset.kind==='calendar'?{proposal:setting('meeting-proposals')?.[task.id]}:{}),title:task.title,sourceKey:task.source?.key||''};const value=await api({action:'submit',id,...d,answer});if(attempt!==epoch)return;if(!requests.some(r=>r.id===value.id))requests.push({calendarResult:value.calendarResult,id:value.id,text:'BOARD_DECISION '+JSON.stringify(d),taskId:task.id,kind:d.kind,choice:d.choice,status:'pending',createdAt:new Date().toISOString()});const existing= requests.find(r=>r.id===value.id);if(existing&&value.calendarResult)existing.calendarResult=value.calendarResult;if(value.calendarError)error=value.calendarError;notice=value.calendarResult?.verified?'Added to your calendar and verified.':d.kind==='calendar'&&d.choice==='confirm'?'Details confirmed. Calendar update not yet completed.':d.choice==='ignore'?'Ignored and saved.':d.choice==='accept'?'Added to your work and saved.':d.choice==='keep'?'Kept open and saved.':'Completed and saved.';render();onChange?.();}catch(e){if(attempt===epoch){error=e.message;render();onChange?.();}}finally{busy.delete(b.dataset.task);b.disabled=false;}});
  $('note-form')?.addEventListener('submit',async event=>{event.preventDefault();const text=$('work-note').value.trim();if(!text)return;const b=$('save-note');b.disabled=true;try{const value=await api({action:'note',id:crypto.randomUUID(),text});$('work-note').value='';requests.push({id:value.id,choice:'note',kind:'note',status:'pending'});error='';}catch(e){error=e.message;}finally{b.disabled=false;render();}});
- return {render,ignored,pending,reset(){epoch++;token='';requests=[];error='';if($('work-note'))$('work-note').value='';},async start(sessionToken){const attempt=++epoch;token=sessionToken;try{const value=await api({action:'status'});if(attempt!==epoch)return;requests=value.requests;error='';}catch(e){if(attempt!==epoch)return;error=e.message;}render();onChange?.();}};
+ return {render,ignored,pending,snapshot,reset(){epoch++;token='';requests=[];error='';notice='';busy.clear();if($('work-note'))$('work-note').value='';},async start(sessionToken){const attempt=++epoch;token=sessionToken;try{const value=await api({action:'status'});if(attempt!==epoch)return;requests=value.requests;error='';}catch(e){if(attempt!==epoch)return;error=e.message;}render();onChange?.();}};
 }
 
 // Read-only suggestions. No task dates, statuses or calendar entries are changed.
@@ -158,7 +187,7 @@ let otpController=null,decisionBoard=null;
 let state=null,store=null,view='today',calendarDay='',planningDay='today',activity=Date.now(),session=0;
 const fmt=(date,options={})=>new Intl.DateTimeFormat('en-GB',{timeZone:'Asia/Hong_Kong',...options}).format(new Date(date));
 const safeLink=url=>{try{return new URL(url).protocol==='https:'?url:'';}catch{return '';}};
-function setting(name){return JSON.parse(state.tables.settings.find(r=>r.key===name)?.json||'null');}
+function setting(name){return JSON.parse((decisionBoard?.snapshot()||state).tables.settings.find(r=>r.key===name)?.json||'null');}
 function visibleCalendarEvents(calendar){const links=setting('google-calendar-sync')?.links||[];return calendar.events.filter(e=>e.provider!=='outlook'||!links.some(l=>(l.sourceId===e.id||l.sourceId===e.recurringId)&&(l.suppressed||calendar.events.some(g=>g.provider==='google'&&(g.id===l.googleId||g.recurringId===l.googleId)))));}
 function lock({forget=false}={}){session++;state=null;store=null;if(forget)otpController?.forget();else otpController?.reset();decisionBoard?.reset();$('workbench').hidden=true;$('gate').hidden=false;for(const id of ['tasks','agenda','read-items','calendar-days','views','results','updated','encouragement','decisions','opportunities','request-status','half-day-plan','plan-overflow','plan-status'])$(id).replaceChildren();$('search').value='';$('unlock-error').textContent='';document.title='Daily';}
 $('lock').onclick=()=>lock({forget:true});
@@ -168,7 +197,7 @@ window.addEventListener('pageshow',()=>{if(!document.hidden&&!state)otpControlle
 for(const event of ['pointerdown','keydown','scroll'])document.addEventListener(event,()=>activity=Date.now(),{passive:true});
 setInterval(()=>{if(state&&Date.now()-activity>600000)lock();},10000);
 const authConfig=await (await fetch('./auth-config.json',{cache:'no-store'})).json();
-decisionBoard=createDecisionBoard({getState:()=>state,endpoint:authConfig.endpoint,onChange:()=>{renderTasks();renderPlanning();}});
+decisionBoard=createDecisionBoard({getState:()=>state,endpoint:authConfig.endpoint,onChange:()=>{renderTasks();renderPlanning();renderCalendar();}});
 otpController=initialiseOtp({endpoint:authConfig.endpoint,onUnlocked:async(secret,sessionToken)=>{const attempt=++session;try{const response=await fetch('./state.enc',{cache:'no-store'});if(!response.ok)throw new Error('Cannot load your encrypted records.');const value=await unseal(await response.json(),secret);secret='';if(attempt!==session)return;if(value.format!=='daily-workbench-github'||value.version!==1||!value.tables)throw new Error('Unsupported workbench data.');state=value;store=state.tables.tasks.map(r=>JSON.parse(r.json));activity=Date.now();$('gate').hidden=true;$('workbench').hidden=false;render();await decisionBoard.start(sessionToken);}finally{secret='';}}});
 await otpController.restore();
 for(const id of ['search','project','sort'])$(id).addEventListener(id==='search'?'input':'change',renderTasks);
@@ -190,7 +219,7 @@ function reviewControls(t){
  return '<div class="decision-actions">'+[['accept',t.opportunity?'Pursue':'Accept'],['ignore','Ignore']].map(([choice,label])=>'<button data-decision="'+choice+'" data-kind="task" data-task="'+escape(t.id)+'" data-revision="'+t.revision+'">'+label+'</button>').join('')+'</div>';
 }
 function renderTasks(){if(!state)return;const day=today(),query=$('search').value.trim().toLowerCase(),project=$('project').value;
- let tasks=store.filter(t=>!t.deletedAt&&!decisionBoard?.ignored(t.id)).filter(t=>view==='today'?(t.status!=='review'&&isToday(t,day)):view==='all'?['todo','waiting'].includes(t.status):t.status===view);
+ let tasks=(decisionBoard?.snapshot()||state).tables.tasks.map(r=>JSON.parse(r.json)).filter(t=>!t.deletedAt).filter(t=>view==='today'?(t.status!=='review'&&isToday(t,day)):view==='all'?['todo','waiting'].includes(t.status):t.status===view);
  tasks=tasks.filter(t=>(!project||t.project===project)&&(!query||[t.title,t.notes,labels[t.project]].join(' ').toLowerCase().includes(query)));
  tasks.sort((a,b)=>{if($('sort').value==='title')return a.title.localeCompare(b.title);const d=(effectiveDueDate(a)||'9999').localeCompare(effectiveDueDate(b)||'9999');if($('sort').value==='deadline')return d;const weight=t=>(effectiveDueDate(t)&&effectiveDueDate(t)<=day?20:0)+(t.importance==='high'?8:0)+(t.priority==='high'?4:0);return weight(b)-weight(a)||d||a.title.localeCompare(b.title);});
  $('results').textContent=tasks.length+' '+(tasks.length===1?'record':'records');
@@ -201,7 +230,7 @@ function renderReads(){const reads=setting('daily-reads');$('reads').hidden=!rea
 
 function renderPlanning(){
  if(!state)return;const day=planningDay==='tomorrow'?addDays(today(),1):today();
- const plan=planHalfDays(state,{day,ignored:id=>decisionBoard?.ignored(id)});
+ const plan=planHalfDays(decisionBoard?.snapshot()||state,{day});
  $('plan-status').textContent=plan.off?'Day off or vacation: no work suggested.':plan.calendarVerified?'Planned around the latest saved calendar events.':'Provisional plan: selected calendars have not been freshly verified.';
  $('half-day-plan').innerHTML=['morning','afternoon','evening'].map(part=>'<section class="plan-part"><h3>'+({morning:'Morning',afternoon:'Afternoon',evening:'Evening'}[part])+'</h3><small>'+plan.availableMinutes[part]+' estimated free minutes</small>'+plan.items.filter(x=>x.kind==='task'&&x.part===part).map(x=>'<div class="plan-item"><time>'+escape(x.start)+'–'+escape(x.end)+'</time>'+escape(x.title)+'<small> · '+x.minutes+' min'+(x.partial?' focus block':' estimate')+'</small></div>').join('')+(plan.items.some(x=>x.kind==='task'&&x.part===part)?'':'<p class="plan-note">No work block suggested.</p>')+'</section>').join('');
  $('plan-overflow').innerHTML=plan.unscheduled.length?'<details class="plan-note"><summary>Still on your list</summary>'+plan.unscheduled.map(x=>'<p>'+escape(x.title)+' · '+escape(x.reason)+'</p>').join('')+'</details>':'';
