@@ -1,3 +1,58 @@
+// Only server-verified receipts and the existing mirror registry establish linkage.
+function calendarVersion(e){return JSON.stringify([e.id,e.title,new Date(e.start).toISOString(),new Date(e.end).toISOString(),e.location||'',Boolean(e.cancelled)]);}
+function managedCalendarEvents(state,requests=[]){
+ const get=k=>JSON.parse(state?.tables.settings.find(r=>r.key===k)?.json||'null');
+ const events=new Map(Object.entries(get('calendar-managed-events')||{}));
+ const calendar=get('calendar');
+ for(const link of get('google-calendar-sync')?.links||[]){
+  if(link.suppressed)continue;
+  for(const e of calendar?.events||[])if(e.provider==='google'&&(e.id===link.googleId||e.recurringId===link.googleId)&&!e.allDay&&!e.recurrence?.length){
+   if(!events.has(e.id))events.set(e.id,{...e,originalStart:e.start,taskId:'calendar:'+e.id,sourceKey:'outlook:'+link.sourceId,sourceId:link.sourceId});
+  }
+ }
+ for(const r of [...requests].sort((a,b)=>String(a.createdAt||'').localeCompare(String(b.createdAt||'')))){
+  if(!r.calendarResult?.verified||!r.text?.startsWith('BOARD_DECISION '))continue;
+  let d;try{d=JSON.parse(r.text.slice(15));}catch{continue;}
+  const e=r.calendarResult.event;if(!e?.id)continue;
+  if(d.kind==='calendar'&&d.choice==='confirm')events.set(e.id,{...e,managedAt:r.calendarResult.verifiedAt,taskId:d.taskId,sourceKey:d.sourceKey||d.proposal?.sourceKey||''});
+  else if(d.kind==='calendar-event'){
+   const prior=events.get(d.eventId);if(!prior||calendarVersion(prior)!==d.expectedVersion)continue;
+   events.set(e.id,{...prior,...e,managedAt:r.calendarResult.verifiedAt,cancelled:d.choice==='cancel'});
+  }
+ }
+ for(const [id,e] of events){const fresh=calendar?.events?.find(x=>x.provider==='google'&&x.id===id);if(!e.cancelled&&fresh&&Date.parse(calendar.checkedAt)>Date.parse(e.managedAt||0))events.set(id,{...e,...fresh});}
+ return [...events.values()];
+}
+function applyCalendarReceipts(state,requests=[]){
+ const events=managedCalendarEvents(state,requests),row=state.tables.settings.find(r=>r.key==='calendar');
+ if(row){const value=JSON.parse(row.json);for(const e of events){value.events=(value.events||[]).filter(x=>!(x.provider==='google'&&x.id===e.id)&&!(e.cancelled&&e.sourceId&&x.provider==='outlook'&&(x.id===e.sourceId||x.recurringId===e.sourceId)&&Date.parse(x.start)===Date.parse(e.originalStart||e.start)));if(!e.cancelled)value.events.push({...e,provider:'google'});}row.json=JSON.stringify(value);}
+ return events;
+}
+
+function createCalendarManager({documentRoot,getState,getRequests,api,onSaved}){
+ const root=documentRoot.getElementById('calendar-manager');if(!root)return {render(){},reset(){}};
+ let cancelling='',message='',error='',busy=false,draft=null,epoch=0;
+ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+ const local=s=>new Date(Date.parse(s)+8*3600000).toISOString().slice(0,16);
+ const events=()=>managedCalendarEvents(getState(),getRequests()).filter(e=>!e.cancelled&&Date.parse(e.end)>Date.now()).sort((a,b)=>Date.parse(a.start)-Date.parse(b.start));
+ function render(){
+  root.innerHTML='<details><summary>Manage linked calendar events</summary><p>Changes sync immediately to Google Calendar. Times are Hong Kong time. Only linked individual events can be changed.</p>'+(message?'<p role="status">'+esc(message)+'</p>':'')+(error?'<p role="alert" class="error">'+esc(error)+'</p>':'')+events().map(e=>{const x=draft?.id===e.id?draft:e;return '<details class="task"><summary>'+esc(e.title)+' · '+esc(local(e.start).replace('T',' '))+'</summary><div class="task-body" data-calendar-editor="'+esc(e.id)+'"><label>Title<input data-calendar-field="title" maxlength="300" value="'+esc(x.title)+'"></label><label>Start (HKT)<input type="datetime-local" data-calendar-field="start" value="'+esc(x.startLocal||local(x.start))+'"></label><label>End (HKT)<input type="datetime-local" data-calendar-field="end" value="'+esc(x.endLocal||local(x.end))+'"></label><label>Location<input data-calendar-field="location" maxlength="500" value="'+esc(x.location||'')+'"></label><button data-calendar-action="update" data-event="'+esc(e.id)+'"'+(busy?' disabled':'')+'>Save calendar changes</button><button data-calendar-action="ask-cancel" data-event="'+esc(e.id)+'"'+(busy?' disabled':'')+'>Cancel event…</button>'+(cancelling===e.id?'<div role="alert"><p>Cancel “'+esc(e.title)+'” on '+esc(local(e.start).replace('T',' '))+' HKT in your Google Calendar? This removes this event only.</p><button data-calendar-action="cancel" data-event="'+esc(e.id)+'"'+(busy?' disabled':'')+'>Yes, cancel this event</button><button data-calendar-action="keep" data-event="'+esc(e.id)+'">Keep event</button></div>':'')+'</div></details>';}).join('')+(!events().length?'<p>No upcoming linked events.</p>':'')+'</details>';
+ }
+ root.addEventListener('click',async event=>{
+  const b=event.target.closest?.('[data-calendar-action]');if(!b||busy)return;
+  const e=events().find(x=>x.id===b.dataset.event);if(!e)return;
+  const choice=b.dataset.calendarAction;
+  if(choice==='ask-cancel'||choice==='keep'){cancelling=choice==='ask-cancel'?e.id:'';render();root.querySelector('details').open=true;const editor=[...root.querySelectorAll('[data-calendar-editor]')].find(x=>x.dataset.calendarEditor===e.id);if(editor)editor.parentElement.open=true;return;}
+  if(choice==='cancel'&&cancelling!==e.id)return;
+  const container=b.closest('[data-calendar-editor]'),fields=Object.fromEntries([...container.querySelectorAll('[data-calendar-field]')].map(x=>[x.dataset.calendarField,x.value]));
+  let proposal;
+  try{if(choice==='update'){proposal={title:fields.title.trim(),start:new Date(fields.start+':00+08:00').toISOString(),end:new Date(fields.end+':00+08:00').toISOString(),location:fields.location.trim()};if(!proposal.title||Date.parse(proposal.end)<=Date.parse(proposal.start))throw Error();}}catch{error='Enter a title and valid start/end times.';render();return;}
+  const attempt=epoch;draft={id:e.id,title:fields.title,location:fields.location,startLocal:fields.start,endLocal:fields.end};busy=true;b.disabled=true;b.textContent='Saving…';error='';message='';
+  try{const result=await api({action:'calendar-change',id:crypto.randomUUID(),eventId:e.id,expectedVersion:calendarVersion(e),choice,proposal,cancelConfirmed:choice==='cancel'});if(attempt!==epoch)return;onSaved(result.request,result.calendarResult);if(result.calendarError)throw Error(result.calendarError);if(!result.calendarResult?.verified)throw Error('Calendar update is not yet verified. Retry to check the saved result.');message=choice==='cancel'?'Cancelled in your calendar and verified.':'Calendar changes saved and verified.';draft=null;cancelling='';}catch(e){if(attempt===epoch)error=e.message;}finally{if(attempt===epoch){busy=false;render();root.querySelector('details').open=true;}}
+ });
+ return {render,reset(){epoch++;cancelling='';message='';error='';draft=null;busy=false;root.replaceChildren();}};
+}
+
 // A deterministic view of durable owner commands, never a second task store.
 function projectDecisionState(state,requests=[]){
  if(!state)return state;const next=structuredClone(state);
@@ -23,6 +78,7 @@ function projectDecisionState(state,requests=[]){
   }
   if(changed){t.revision++;t.updatedAt=request.createdAt||t.updatedAt;entry.row.json=JSON.stringify(t);}
  }
+ applyCalendarReceipts(next,requests);
  return next;
 }
 function createDecisionBoard({getState,endpoint,onChange,documentRoot=document,fetcher=fetch}){
@@ -34,11 +90,13 @@ function createDecisionBoard({getState,endpoint,onChange,documentRoot=document,f
  const pending=id=>requests.find(r=>r.taskId===id&&r.status==='pending'&&r.kind==='calendar'&&r.choice==='confirm'&&!r.calendarResult?.verified);
  const ignored=id=>requests.some(r=>r.taskId===id&&r.choice==='ignore'&&(r.status==='pending'||r.currentTaskStatus==='cancelled'));
  async function api(data){const r=await fetcher(endpoint.replace(/\/$/,'')+'/board',{method:'POST',credentials:'omit',redirect:'error',cache:'no-store',signal:AbortSignal.timeout(60000),headers:{'Content-Type':'application/json'},body:JSON.stringify({...data,sessionToken:token})});const value=await r.json();if(!r.ok)throw Error(value.error||'Could not save your choice.');return value;}
+ const calendarManager=createCalendarManager({documentRoot,getState:()=>getState(),getRequests:()=>requests,api,onSaved:(request,result)=>{const old=requests.find(r=>r.id===request.id);if(old){if(result)old.calendarResult=result;}else requests.push({...request,calendarResult:result});render();onChange?.();}});
  const source=t=>/^https:\/\//.test(t.source?.url||t.link||'')?'<a target="_blank" rel="noopener noreferrer" href="'+esc(t.source?.url||t.link)+'">View source ↗</a>':'';
  const buttons=(t,kind,choices,feedbackId='')=>pending(t.id)?'<p class="queued">Confirmed · calendar update not yet completed</p><button data-decision="confirm" data-kind="calendar" data-task="'+esc(t.id)+'" data-revision="'+t.revision+'">Retry calendar update</button>':'<div class="decision-actions">'+choices.map(([choice,label])=>'<button data-decision="'+choice+'" data-task="'+esc(t.id)+'" data-revision="'+t.revision+'" data-kind="'+kind+'" data-feedback="'+esc(feedbackId)+'">'+label+'</button>').join('')+'</div>';
  const date=(label,value)=>'<div><dt>'+label+'</dt><dd>'+esc(value||'Not confirmed')+'</dd></div>';
  function render(){
   if(!getState())return;
+  calendarManager.render();
   const list=tasks().filter(t=>!t.deletedAt),proposals=setting('meeting-proposals')||{};
   const decisions=list.filter(t=>t.status==='review'&&!t.opportunity&&(proposals[t.id]||t.importance==='high'||t.priority==='high'||/^Decide whether/i.test(t.title)||(effectiveDueDate(t)&&effectiveDueDate(t)<=addDays(today(),7)))).sort((a,b)=>Number(Boolean(proposals[b.id]))-Number(Boolean(proposals[a.id]))||((a.dueDate||'9999').localeCompare(b.dueDate||'9999'))||String(b.updatedAt).localeCompare(a.updatedAt));
   const projectedFeedback=snapshot()?.tables.settings.find(x=>x.key==='completion-feedback');
@@ -54,7 +112,7 @@ function createDecisionBoard({getState,endpoint,onChange,documentRoot=document,f
  }
  documentRoot.addEventListener('click',async event=>{const b=event.target.closest?.('[data-decision]');if(!b||!getState()||busy.has(b.dataset.task))return;busy.add(b.dataset.task);b.disabled=true;b.textContent='Saving…';error='';notice='';const attempt=epoch;try{const task=tasks().find(t=>t.id===b.dataset.task);if(!task)throw Error('Please refresh.');const id=crypto.randomUUID(),answer=pending(task.id)?JSON.parse(pending(task.id).text.slice(15)).answer||'':$('answer-'+task.id)?.value.trim()||'',d={kind:b.dataset.kind,taskId:task.id,revision:Number(b.dataset.revision),choice:b.dataset.decision,feedbackId:b.dataset.feedback,...(b.dataset.kind==='calendar'?{proposal:setting('meeting-proposals')?.[task.id]}:{}),title:task.title,sourceKey:task.source?.key||''};const value=await api({action:'submit',id,...d,answer});if(attempt!==epoch)return;if(!requests.some(r=>r.id===value.id))requests.push({calendarResult:value.calendarResult,id:value.id,text:'BOARD_DECISION '+JSON.stringify(d),taskId:task.id,kind:d.kind,choice:d.choice,status:'pending',createdAt:new Date().toISOString()});const existing= requests.find(r=>r.id===value.id);if(existing&&value.calendarResult)existing.calendarResult=value.calendarResult;if(value.calendarError)error=value.calendarError;notice=value.calendarResult?.verified?'Added to your calendar and verified.':d.kind==='calendar'&&d.choice==='confirm'?'Details confirmed. Calendar update not yet completed.':d.choice==='ignore'?'Ignored and saved.':d.choice==='accept'?'Added to your work and saved.':d.choice==='keep'?'Kept open and saved.':'Completed and saved.';render();onChange?.();}catch(e){if(attempt===epoch){error=e.message;render();onChange?.();}}finally{busy.delete(b.dataset.task);b.disabled=false;}});
  $('note-form')?.addEventListener('submit',async event=>{event.preventDefault();const text=$('work-note').value.trim();if(!text)return;const b=$('save-note');b.disabled=true;try{const value=await api({action:'note',id:crypto.randomUUID(),text});$('work-note').value='';requests.push({id:value.id,choice:'note',kind:'note',status:'pending'});error='';}catch(e){error=e.message;}finally{b.disabled=false;render();}});
- return {render,ignored,pending,snapshot,reset(){epoch++;token='';requests=[];error='';notice='';busy.clear();if($('work-note'))$('work-note').value='';},async start(sessionToken){const attempt=++epoch;token=sessionToken;try{const value=await api({action:'status'});if(attempt!==epoch)return;requests=value.requests;error='';}catch(e){if(attempt!==epoch)return;error=e.message;}render();onChange?.();}};
+ return {render,ignored,pending,snapshot,reset(){calendarManager.reset();epoch++;token='';requests=[];error='';notice='';busy.clear();if($('work-note'))$('work-note').value='';},async start(sessionToken){const attempt=++epoch;token=sessionToken;try{const value=await api({action:'status'});if(attempt!==epoch)return;requests=value.requests;error='';}catch(e){if(attempt!==epoch)return;error=e.message;}render();onChange?.();}};
 }
 
 // Read-only suggestions. No task dates, statuses or calendar entries are changed.
